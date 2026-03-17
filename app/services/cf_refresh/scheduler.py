@@ -74,6 +74,7 @@ async def _scheduler_loop():
     while True:
         if is_enabled():
             await refresh_once()
+            logger.debug(f"cf_refresh 下次刷新间隔: {get_refresh_interval()}s")
         else:
             logger.debug("cf_refresh disabled, skip refresh")
         interval = get_refresh_interval()
@@ -85,7 +86,11 @@ def start():
     global _task
     if _task is not None:
         return
-    _task = asyncio.get_event_loop().create_task(_scheduler_loop())
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    _task = loop.create_task(_scheduler_loop())
     logger.info("cf_refresh background task started")
 
 

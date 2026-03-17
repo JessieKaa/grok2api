@@ -2,15 +2,84 @@
 WebSocket helpers for reverse interfaces.
 """
 
+import time
 import ssl
 import certifi
 import aiohttp
 from aiohttp_socks import ProxyConnector
 from typing import Mapping, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
 
 from app.core.logger import logger
 from app.core.config import get_config
+
+_SENSITIVE_FIELDS = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "password",
+    "passwd",
+    "secret",
+    "session",
+}
+
+
+def _is_sensitive_key(key: str) -> bool:
+    k = (key or "").strip().lower()
+    return k in _SENSITIVE_FIELDS or any(
+        part in k for part in ("cookie", "token", "secret", "password", "authorization")
+    )
+
+
+def _truncate_text(value: Any, limit: int = 500) -> str:
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(+{len(text) - limit} chars)"
+
+
+def _sanitize_headers(headers: Optional[Mapping[str, str]]) -> dict[str, str]:
+    if not headers:
+        return {}
+    sanitized: dict[str, str] = {}
+    for key, value in headers.items():
+        key_str = str(key)
+        if _is_sensitive_key(key_str):
+            sanitized[key_str] = "[REDACTED]"
+        else:
+            sanitized[key_str] = _truncate_text(value, 512)
+    return sanitized
+
+
+def _sanitize_url(url: str) -> str:
+    if not isinstance(url, str) or not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        if not parsed.query:
+            return url
+        masked_pairs = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if _is_sensitive_key(key):
+                masked_pairs.append((key, "[REDACTED]"))
+            else:
+                masked_pairs.append((key, value))
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(masked_pairs, doseq=True),
+                parsed.fragment,
+            )
+        )
+    except Exception:
+        return url
 
 
 def _default_ssl_context() -> ssl.SSLContext:
@@ -71,20 +140,108 @@ def resolve_proxy(proxy_url: Optional[str] = None, ssl_context: ssl.SSLContext =
 class WebSocketConnection:
     """WebSocket connection wrapper."""
 
-    def __init__(self, session: aiohttp.ClientSession, ws: aiohttp.ClientWebSocketResponse) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        ws: aiohttp.ClientWebSocketResponse,
+        *,
+        url: str = "",
+    ) -> None:
         self.session = session
         self.ws = ws
+        self.url = _sanitize_url(url)
+        self._opened_at = time.perf_counter()
+        self._send_count = 0
+        self._recv_count = 0
+
+    async def send_json(self, data: Any, compress: Optional[int] = None, *, dumps=None) -> None:
+        self._send_count += 1
+        payload_preview = _truncate_text(data, 1500)
+        logger.debug(
+            "Grok websocket send",
+            extra={
+                "ws_event": {
+                    "url": self.url,
+                    "type": "json",
+                    "count": self._send_count,
+                    "payload_preview": payload_preview,
+                }
+            },
+        )
+        await self.ws.send_json(data, compress=compress, dumps=dumps)
+
+    async def send_str(self, data: str, compress: Optional[int] = None) -> None:
+        self._send_count += 1
+        logger.debug(
+            "Grok websocket send",
+            extra={
+                "ws_event": {
+                    "url": self.url,
+                    "type": "text",
+                    "count": self._send_count,
+                    "payload_preview": _truncate_text(data, 1500),
+                }
+            },
+        )
+        await self.ws.send_str(data, compress=compress)
+
+    async def send_bytes(self, data: bytes, compress: Optional[int] = None) -> None:
+        self._send_count += 1
+        logger.debug(
+            "Grok websocket send",
+            extra={
+                "ws_event": {
+                    "url": self.url,
+                    "type": "bytes",
+                    "count": self._send_count,
+                    "size": len(data or b""),
+                }
+            },
+        )
+        await self.ws.send_bytes(data, compress=compress)
+
+    async def receive(self, timeout: Optional[float] = None) -> aiohttp.WSMessage:
+        msg = await self.ws.receive(timeout=timeout)
+        self._recv_count += 1
+        details: dict[str, Any] = {
+            "url": self.url,
+            "count": self._recv_count,
+            "msg_type": str(msg.type),
+        }
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            details["payload_preview"] = _truncate_text(msg.data, 1500)
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            details["size"] = len(msg.data or b"")
+        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+            details["extra"] = _truncate_text(msg.extra, 500)
+        logger.debug("Grok websocket receive", extra={"ws_event": details})
+        return msg
 
     async def close(self) -> None:
         if not self.ws.closed:
             await self.ws.close()
+        elapsed_ms = round((time.perf_counter() - self._opened_at) * 1000, 2)
+        logger.info(
+            "Grok websocket closed",
+            extra={
+                "ws_close": {
+                    "url": self.url,
+                    "elapsed_ms": elapsed_ms,
+                    "send_count": self._send_count,
+                    "recv_count": self._recv_count,
+                }
+            },
+        )
         await self.session.close()
 
-    async def __aenter__(self) -> aiohttp.ClientWebSocketResponse:
-        return self.ws
+    async def __aenter__(self) -> "WebSocketConnection":
+        return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.ws, name)
 
 
 class WebSocketClient:
@@ -114,7 +271,17 @@ class WebSocketClient:
         # Resolve proxy dynamically from config if not overridden
         proxy_url = self._proxy_override or get_config("proxy.base_proxy_url")
         connector, resolved_proxy = resolve_proxy(proxy_url, self._ssl_context)
-        logger.debug(f"WebSocket connect: proxy_url={proxy_url}, resolved_proxy={resolved_proxy}, connector={type(connector).__name__}")
+        safe_url = _sanitize_url(url)
+        req_log = {
+            "url": safe_url,
+            "headers": _sanitize_headers(headers),
+            "timeout": timeout,
+            "proxy_url": _sanitize_url(proxy_url or ""),
+            "resolved_proxy": _sanitize_url(resolved_proxy or ""),
+            "connector": type(connector).__name__,
+            "ws_kwargs": dict(ws_kwargs or {}),
+        }
+        logger.info("Grok websocket connect request", extra={"ws_connect_request": req_log})
 
         # Build client timeout
         total_timeout = (
@@ -126,6 +293,7 @@ class WebSocketClient:
 
         # Create session
         session = aiohttp.ClientSession(connector=connector, timeout=client_timeout)
+        start = time.perf_counter()
         try:
             # Cast to Any to avoid Pylance errors with **extra_kwargs
             extra_kwargs: dict[str, Any] = dict(ws_kwargs or {})
@@ -162,8 +330,29 @@ class WebSocketClient:
                     ssl=self._ssl_context,
                     **extra_kwargs,
                 )
-            return WebSocketConnection(session, ws)
-        except Exception:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            logger.info(
+                "Grok websocket connect response",
+                extra={
+                    "ws_connect_response": {
+                        "url": safe_url,
+                        "elapsed_ms": elapsed_ms,
+                        "closed": ws.closed,
+                    }
+                },
+            )
+            return WebSocketConnection(session, ws, url=safe_url)
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            logger.error(
+                "Grok websocket connect failed",
+                extra={
+                    "ws_connect_request": req_log,
+                    "elapsed_ms": elapsed_ms,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
             await session.close()
             raise
 

@@ -94,6 +94,7 @@ async def lifespan(app: FastAPI):
     cf_refresh_start()
 
     logger.info("Application startup complete.")
+    logger.info("Server is ready to accept connections (e.g. GET /health, POST /v1/chat/completions).")
     yield
 
     # 关闭

@@ -1,0 +1,8 @@
+POST http://localhost:8000/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer 7sM5RM2RTDkftaSI
+
+{
+  "model": "grok-4",
+  "messages": [{"role":"user","content":"你好"}]
+}
